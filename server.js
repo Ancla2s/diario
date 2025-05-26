@@ -1,91 +1,76 @@
 // backend/server.js
-
 const express = require('express');
 const cors = require('cors');
-const admin = require('firebase-admin');
-// ... otras importaciones
+const XLSX = require('xlsx');
+const admin = require('firebase-admin'); // Importa firebase-admin
 
-// Configuración de Firebase Admin SDK
-// ¡IMPORTANTE! Asegúrate de que las credenciales no estén hardcodeadas.
-// Debes obtenerlas de variables de entorno en producción.
-// Por ejemplo, usando una variable de entorno para el JSON de credenciales o sus partes.
-
-// EJEMPLO de cómo cargar credenciales de forma segura
-// Si tienes un archivo JSON de credenciales, puedes leerlo como una variable de entorno en Render.
-// O pasar cada campo como una variable de entorno separada (más seguro).
-// Por ahora, asumiremos que usarás una variable de entorno llamada FIREBASE_SERVICE_ACCOUNT.
-// (Render te permitirá configurar esto más adelante)
-// const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-
-// Si prefieres usar variables de entorno para cada parte de las credenciales, sería algo así:
-const serviceAccount = {
-  "type": process.env.FIREBASE_TYPE,
-  "project_id": process.env.FIREBASE_PROJECT_ID,
-  "private_key_id": process.env.FIREBASE_PRIVATE_KEY_ID,
-  "private_key": process.env.FIREBASE_PRIVATE_KEY ? process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n') : undefined, // Manejar saltos de línea
-  "client_email": process.env.FIREBASE_CLIENT_EMAIL,
-  "client_id": process.env.FIREBASE_CLIENT_ID,
-  "auth_uri": process.env.FIREBASE_AUTH_URI,
-  "token_uri": process.env.FIREBASE_TOKEN_URI,
-  "auth_provider_x509_cert_url": process.env.FIREBASE_AUTH_PROVIDER_X509_CERT_URL,
-  "client_x509_cert_url": process.env.FIREBASE_CLIENT_X509_CERT_URL,
-  "universe_domain": process.env.FIREBASE_UNIVERSE_DOMAIN
-};
-
+// Inicializa Firebase Admin SDK (REEMPLAZA CON LA RUTA A TU ARCHIVO JSON DE CLAVE DE SERVICIO)
+const serviceAccount = require('./serviceAccountKey.json'); // Asegúrate de que este archivo exista en tu carpeta backend
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount)
 });
 
-const db = admin.firestore(); // Exporta db para usarlo en tus rutas
+const db = admin.firestore(); // Obtén la instancia de Firestore Admin
 
 const app = express();
-const PORT = process.env.PORT || 3001; // Render asignará un PORT dinámicamente
+const PORT = 3001;
 
-app.use(cors()); // Permite CORS para que el frontend pueda comunicarse
-app.use(express.json()); // Habilita el parsing de JSON en el cuerpo de las solicitudes
+app.use(cors());
+app.use(express.json());
 
-// Ruta de prueba
-app.get('/', (req, res) => {
-  res.send('Backend de Diario de Trading funcionando!');
-});
+// NOTA: Las rutas /api/trades (GET, POST, PUT, DELETE) originales YA NO SERÁN USADAS por el frontend de React
+// porque el frontend ahora se comunica directamente con Firestore.
+// Solo mantenemos la ruta de exportación.
 
 // Ruta para exportar a Excel
 app.get('/api/trades/export-excel', async (req, res) => {
-    const userId = req.query.userId;
+    const userId = req.query.userId; // Obtén el userId desde la query string
     if (!userId) {
-        return res.status(400).send('User ID is required.');
+        return res.status(400).json({ error: 'Falta el ID de usuario para la exportación.' });
     }
 
     try {
-        const tradesRef = db.collection('users').doc(userId).collection('trades');
-        const snapshot = await tradesRef.get();
+        // Obtén los trades del usuario específico desde Firestore
+        const tradesColRef = db.collection('users').doc(userId).collection('trades');
+        const querySnapshot = await tradesColRef.get();
+        const trades = querySnapshot.docs.map(doc => doc.data());
 
-        if (snapshot.empty) {
-            return res.status(404).send('No trades found for this user.');
+        if (trades.length === 0) {
+            return res.status(404).json({ message: 'No hay operaciones para exportar para este usuario.' });
         }
 
-        let csv = "Date,Ticker,Position Type,Contracts,Entry Price,Exit Price,Contract Size,Initial Margin,Fees and Slippage,Profit/Loss,Notes\n";
-        snapshot.forEach(doc => {
-            const data = doc.data();
-            const profitLoss = (data.positionType === 'long')
-                ? (data.exitPrice - data.entryPrice) * data.contracts * data.contractSize - (data.feesAndSlippage || 0)
-                : (data.entryPrice - data.exitPrice) * data.contracts * data.contractSize - (data.feesAndSlippage || 0);
+        // Mapea los datos para que sean más legibles en Excel
+        const dataToExport = trades.map(trade => ({
+            Fecha: trade.date,
+            Simbolo: trade.ticker,
+            Posicion: trade.positionType,
+            Contratos: trade.contracts,
+            'Precio de Entrada': trade.entryPrice,
+            'Precio de Salida': trade.exitPrice,
+            'Tamaño de Contrato': trade.contractSize,
+            'Margen Inicial': trade.initialMargin,
+            'Comisiones/Slippage': trade.feesAndSlippage,
+            Notas: trade.notes,
+            'Ganancia/Pérdida Realizada': (parseFloat(trade.exitPrice) - parseFloat(trade.entryPrice)) * parseFloat(trade.contracts) * parseFloat(trade.contractSize) - parseFloat(trade.feesAndSlippage || 0)
+        }));
 
-            csv += `${data.date},${data.ticker},${data.positionType},${data.contracts},${data.entryPrice},${data.exitPrice},${data.contractSize},${data.initialMargin || 0},${data.feesAndSlippage || 0},${profitLoss.toFixed(2)},"${data.notes.replace(/"/g, '""')}"\n`;
-        });
+        const ws = XLSX.utils.json_to_sheet(dataToExport);
+        const wb = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(wb, ws, "Historial de Trading");
 
-        res.header('Content-Type', 'text/csv');
-        res.attachment('trades_export.csv');
-        res.send(csv);
+        const buffer = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+
+        res.setHeader('Content-Disposition', 'attachment; filename=historial_trading.xlsx');
+        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        res.send(buffer);
 
     } catch (error) {
-        console.error('Error exporting trades:', error);
-        res.status(500).send('Error exporting trades.');
+        console.error('Error al exportar a Excel:', error);
+        res.status(500).json({ error: 'Error al exportar el historial a Excel.' });
     }
 });
 
-
 app.listen(PORT, () => {
-  console.log(`Backend server running on port ${PORT}`);
+  console.log(`Backend server running on http://localhost:${PORT}`);
 });
